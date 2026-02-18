@@ -1,0 +1,428 @@
+name: Build and Deploy to Orbit
+
+on:
+  push:
+    branches:
+      - master
+      - 'feature/**'
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: 'Deploy after build (true/false)'
+        required: false
+        default: 'true'
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  SERVICE: home
+  REGISTRY: artifactory.build.ingka.ikea.com
+  DEV_REPO: selling-api-docker-dev-local
+  RELEASE_REPO: selling-api-docker-release-local
+  ORBIT_NAMESPACE: ingka-sapi-sandbox
+  ORBIT_CLUSTER_NAME: user-orbit-dev-001
+  ORBIT_PROJECT_ID: ingka-cloud-orbit-dev
+  ORBIT_LOCATION: europe-west4
+
+jobs:
+  build-and-push:
+    runs-on: [self-hosted, linux, x64]
+    outputs:
+      image: ${{ steps.vars.outputs.image }}
+      tag: ${{ steps.vars.outputs.tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '11'
+          cache: gradle
+
+      - name: Compute tag + image
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ref_name="${GITHUB_REF_NAME}"
+          if [[ "${ref_name}" == "master" ]]; then
+            tag="${GITHUB_SHA::7}"
+            repo="${RELEASE_REPO}"
+          else
+            tag="$(echo "${ref_name}" | tr '[:upper:]' '[:lower:]' | sed 's|/|-|g')"
+            repo="${DEV_REPO}"
+          fi
+
+          image="${REGISTRY}/${repo}/${SERVICE}"
+
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare Maven settings.xml (gradle-maven-auth)
+        shell: bash
+        env:
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.m2"
+
+          if [[ -z "${NEXUS_USERNAME:-}" || -z "${NEXUS_PASSWORD:-}" ]]; then
+            echo "::error::Missing Nexus credentials. The build pulls dependencies from http://10.229.69.165:4000 and it returns 401 Unauthorized." \
+                 "Create GitHub Actions secrets NEXUS_USERNAME and NEXUS_PASSWORD (repo or org level), then re-run."
+            exit 1
+          fi
+
+          printf '%s\n' \
+            '<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0 https://maven.apache.org/xsd/settings-1.0.0.xsd">' \
+            '  <servers>' \
+            '    <server>' \
+            '      <id>nexus</id>' \
+            "      <username>${NEXUS_USERNAME}</username>" \
+            "      <password>${NEXUS_PASSWORD}</password>" \
+            '    </server>' \
+            '  </servers>' \
+            '</settings>' \
+            > "$HOME/.m2/settings.xml"
+
+      - name: Check Nexus reachability
+        shell: bash
+        env:
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+        run: |
+          set -euo pipefail
+          url="http://10.229.69.165:4000/content/groups/public/"
+          echo "Checking ${url}"
+          status=$(curl -sS -o /dev/null -I --max-time 10 -u "${NEXUS_USERNAME}:${NEXUS_PASSWORD}" -w "%{http_code}" "${url}" || true)
+          echo "Nexus HTTP status: ${status}"
+          if [[ "${status}" == "401" || "${status}" == "403" ]]; then
+            echo "::error::Nexus credentials rejected for ${url} (HTTP ${status}). Use a Nexus repo/service user (not UI-only), or request read access to the public group."
+            exit 1
+          fi
+
+      - name: Build (Gradle)
+        id: gradle_build
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+
+          mkdir -p build/ci-logs
+
+          # Capture full Gradle output for post-mortem; GHES job logs can truncate.
+          set +e
+          ./gradlew clean build \
+            -PbaseNameVar=${SERVICE} \
+            -PappVersion=${GITHUB_RUN_NUMBER} \
+            -Porigin=outside-ikea \
+            --refresh-dependencies \
+            --stacktrace \
+            --info \
+            --console=plain \
+            --no-daemon \
+            2>&1 | tee build/ci-logs/gradle-build.log
+          gradle_rc=${PIPESTATUS[0]}
+          set -e
+
+          # Best-effort: include daemon log tail (useful when Gradle truncates stacktraces).
+          if [[ -d "$HOME/.gradle/daemon/6.8.1" ]]; then
+            daemon_log=$(ls -1 "$HOME/.gradle/daemon/6.8.1"/daemon-*.out.log 2>/dev/null | sort | tail -n 1 || true)
+            if [[ -n "${daemon_log}" && -f "${daemon_log}" ]]; then
+              tail -n 500 "${daemon_log}" > build/ci-logs/gradle-daemon-tail.log || true
+            fi
+          fi
+
+          final_rc=${gradle_rc}
+          if [[ ${gradle_rc} -eq 0 ]]; then
+            ls -lah build/libs/ || true
+
+            # Normalize jar name for a stable Dockerfile COPY.
+            jar_path="build/libs/${SERVICE}-${GITHUB_RUN_NUMBER}.jar"
+            if [[ -f "${jar_path}" ]]; then
+              cp "${jar_path}" build/libs/app.jar
+            else
+              echo "::error::Expected jar not found at ${jar_path}. Contents of build/libs:" 
+              ls -lah build/libs/ || true
+              final_rc=2
+            fi
+          fi
+
+          echo "rc=${final_rc}" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Upload Gradle logs + reports
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v3
+        with:
+          name: gradle-logs-and-reports
+          if-no-files-found: ignore
+          retention-days: 7
+          path: |
+            build/ci-logs/**
+            build/reports/**
+            build/test-results/**
+            build/libs/*.jar
+
+      - name: Fail if Gradle build failed
+        if: ${{ steps.gradle_build.outputs.rc != '0' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::error::Gradle build failed (rc=${{ steps.gradle_build.outputs.rc }}). See the 'gradle-logs-and-reports' artifact for full details."
+
+          if [[ -f build/ci-logs/gradle-build.log ]]; then
+            echo "::group::Gradle log tail (last 200 lines)"
+            tail -n 200 build/ci-logs/gradle-build.log || true
+            echo "::endgroup::"
+          fi
+
+          if [[ -d build/reports/tests/test ]]; then
+            echo "::group::Test report directory listing"
+            find build/reports/tests/test -maxdepth 2 -type f | head -n 50 || true
+            echo "::endgroup::"
+          fi
+
+          if [[ -d build/reports/spotless ]]; then
+            echo "::group::Spotless report directory listing"
+            find build/reports/spotless -maxdepth 2 -type f | head -n 50 || true
+            echo "::endgroup::"
+          fi
+          exit 1
+
+      # Node is needed by jfrog/setup-jfrog-cli
+      - name: Setup Node
+        uses: actions/setup-node@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Setup JFrog CLI (OIDC)
+        uses: jfrog/setup-jfrog-cli@v4
+        id: jfrog
+        env:
+          JF_URL: https://artifactory.build.ingka.ikea.com
+        with:
+          # GHES compatibility: avoid expression fallbacks here.
+          oidc-provider-name: ghes-prod
+          oidc-audience: "jfrog-github"
+
+      - name: Login to Artifactory
+        uses: docker/login-action@v3
+        with:
+          registry: artifactory.build.ingka.ikea.com
+          username: ${{ steps.jfrog.outputs.oidc-user }}
+          password: ${{ steps.jfrog.outputs.oidc-token }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.tag }}
+
+      - name: Notify Slack (build result)
+        if: ${{ always() }}
+        shell: bash
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          JOB_STATUS: ${{ job.status }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref_name }}
+          IMAGE: ${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.tag }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${SLACK_WEBHOOK:-}" ]]; then
+            echo "SLACK_WEBHOOK not set; skipping Slack notification."
+            exit 0
+          fi
+
+          payload="$(python3 -c 'import json,os; status=os.getenv("JOB_STATUS","unknown"); repo=os.getenv("REPO",""); ref=os.getenv("REF",""); image=os.getenv("IMAGE",""); run_url=os.getenv("RUN_URL",""); text=f"Orbit build: {repo}\\nStatus: {status}\\nRef: {ref}\\nImage: {image}\\nRun: {run_url}"; print(json.dumps({"text": text}))')"
+
+          curl -sS -X POST -H 'Content-type: application/json' --data "${payload}" "${SLACK_WEBHOOK}"
+
+  deploy:
+    runs-on: [self-hosted, linux, x64]
+    needs: [build-and-push]
+    if: ${{ github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/feature/') || (github.event_name == 'workflow_dispatch' && inputs.deploy == 'true') }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate WIF inputs
+        shell: bash
+        env:
+          WIP: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          SA: ${{ secrets.GCP_DEPLOY_SERVICE_ACCOUNT }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${WIP}" ]]; then
+            echo "::error::Missing secret GCP_WORKLOAD_IDENTITY_PROVIDER"
+            exit 1
+          fi
+          if [[ -z "${SA}" ]]; then
+            echo "::error::Missing secret GCP_DEPLOY_SERVICE_ACCOUNT"
+            exit 1
+          fi
+
+          if [[ "${WIP}" == principal://* ]]; then
+            echo "::error::GCP_WORKLOAD_IDENTITY_PROVIDER is set to a principal URI (principal://...)." \
+                 "It must be the provider resource path: projects/<number>/locations/global/workloadIdentityPools/<pool>/providers/<provider>."
+            exit 1
+          fi
+
+          if [[ ! "${WIP}" =~ ^projects/[0-9]+/locations/global/workloadIdentityPools/.+/providers/.+$ ]]; then
+            echo "::warning::GCP_WORKLOAD_IDENTITY_PROVIDER doesn't look like a provider resource path: '${WIP}'." \
+                 "Expected: projects/<number>/locations/global/workloadIdentityPools/<pool>/providers/<provider>"
+          fi
+
+          if [[ ! "${SA}" =~ ^[a-zA-Z0-9._-]+@[a-zA-Z0-9.-]+\.iam\.gserviceaccount\.com$ ]]; then
+            echo "::warning::GCP_DEPLOY_SERVICE_ACCOUNT doesn't look like a service account email: '${SA}'."
+          fi
+
+      # Uses Orbit workflows-library pattern (WIF auth + kubectl + connect-gateway credentials).
+      - name: Get Orbit cluster credentials
+        uses: ./.github/actions/get-cluster-credentials
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOY_SERVICE_ACCOUNT }}
+          project_id: ${{ env.ORBIT_PROJECT_ID }}
+          location: ${{ env.ORBIT_LOCATION }}
+          cluster_name: ${{ env.ORBIT_CLUSTER_NAME }}
+
+      - name: Apply Kubernetes manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+          ns="${ORBIT_NAMESPACE}"
+          image="${{ needs.build-and-push.outputs.image }}:${{ needs.build-and-push.outputs.tag }}"
+
+          # Ensure the Deployment uses the freshly built image before applying.
+          # This avoids a transient rollout to the placeholder tag in k8s/orbit/deployment.yaml.
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          deployment_path = Path('k8s/orbit/deployment.yaml')
+          text = deployment_path.read_text(encoding='utf-8')
+          image = '${{ needs.build-and-push.outputs.image }}:${{ needs.build-and-push.outputs.tag }}'
+
+          pattern = re.compile(r'^(\s*image:\s*).*$' , flags=re.MULTILINE)
+
+          def repl(match: re.Match) -> str:
+            return match.group(1) + image
+
+          new_text, count = pattern.subn(repl, text, count=1)
+          if count != 1:
+            raise SystemExit(f"Expected exactly 1 image line to replace, got {count}")
+
+          deployment_path.write_text(new_text, encoding='utf-8')
+          print(f"Updated {deployment_path} image -> {image}")
+          PY
+
+          kubectl apply -n "${ns}" -f k8s/orbit/
+
+      - name: Apply env vars from properties file (if present)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ns="${ORBIT_NAMESPACE}"
+
+          # Preserve ADO behavior of applying env vars from a .properties file.
+          # Update this path/name if Orbit uses a different config mechanism.
+          props="environment/ikeadt/configs/${SERVICE}-sandbox-auth0.properties"
+          if [[ -f "${props}" ]]; then
+            # kubectl doesn't support '--from-env-file' on 'set env'.
+            # Instead, create/update a ConfigMap from the env-file and set env from it.
+            cm="${SERVICE}-envfile"
+            kubectl create configmap "${cm}" -n "${ns}" --from-env-file="${props}" \
+              --dry-run=client -o yaml | kubectl apply -f -
+
+            kubectl set env -n "${ns}" deployment/${SERVICE} --from=configmap/${cm} --overwrite
+          else
+            echo "No properties file found at ${props}; skipping."
+          fi
+
+      - name: Wait for rollout
+        shell: bash
+        run: |
+          set -euo pipefail
+          ns="${ORBIT_NAMESPACE}"
+
+          echo "Deployment status (pre-rollout):"
+          kubectl get deployment/${SERVICE} -n "${ns}" -o wide || true
+          kubectl get rs -n "${ns}" -l app=${SERVICE} -o wide || true
+          kubectl get pods -n "${ns}" -l app=${SERVICE} -o wide || true
+
+          if ! kubectl rollout status -n "${ns}" deployment/${SERVICE} --timeout=600s; then
+            echo "::error::Rollout timed out. Dumping diagnostics..."
+
+            echo "::group::kubectl get all"
+            kubectl get all -n "${ns}" || true
+            echo "::endgroup::"
+
+            echo "::group::kubectl get events (last 200)"
+            kubectl get events -n "${ns}" --sort-by=.lastTimestamp | tail -n 200 || true
+            echo "::endgroup::"
+
+            echo "::group::kubectl describe deployment/${SERVICE}"
+            kubectl describe deployment/${SERVICE} -n "${ns}" || true
+            echo "::endgroup::"
+
+            echo "::group::kubectl describe replicaset(s)"
+            kubectl describe rs -n "${ns}" -l app=${SERVICE} || true
+            echo "::endgroup::"
+
+            echo "::group::kubectl describe pods"
+            kubectl describe pods -n "${ns}" -l app=${SERVICE} || true
+            echo "::endgroup::"
+
+            pods=$(kubectl get pods -n "${ns}" -l app=${SERVICE} -o jsonpath='{.items[*].metadata.name}' || true)
+            for pod in ${pods}; do
+              echo "::group::Logs for ${pod} (current)"
+              kubectl logs -n "${ns}" "${pod}" --all-containers --tail=200 || true
+              echo "::endgroup::"
+
+              echo "::group::Logs for ${pod} (previous)"
+              kubectl logs -n "${ns}" "${pod}" --all-containers --previous --tail=200 || true
+              echo "::endgroup::"
+            done
+
+            exit 1
+          fi
+
+      - name: Notify Slack (deploy result)
+        if: ${{ always() }}
+        shell: bash
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          JOB_STATUS: ${{ job.status }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref_name }}
+          IMAGE: ${{ needs.build-and-push.outputs.image }}:${{ needs.build-and-push.outputs.tag }}
+          CLUSTER: ${ORBIT_CLUSTER_NAME}
+          NAMESPACE: ${ORBIT_NAMESPACE}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${SLACK_WEBHOOK:-}" ]]; then
+            echo "SLACK_WEBHOOK not set; skipping Slack notification."
+            exit 0
+          fi
+
+          payload="$(python3 -c 'import json,os; status=os.getenv("JOB_STATUS","unknown"); repo=os.getenv("REPO",""); ref=os.getenv("REF",""); image=os.getenv("IMAGE",""); cluster=os.getenv("CLUSTER",""); namespace=os.getenv("NAMESPACE",""); run_url=os.getenv("RUN_URL",""); text=f"Orbit deploy: {repo}\\nStatus: {status}\\nRef: {ref}\\nImage: {image}\\nCluster: {cluster}\\nNamespace: {namespace}\\nRun: {run_url}"; print(json.dumps({"text": text}))')"
+
+          curl -sS -X POST -H 'Content-type: application/json' --data "${payload}" "${SLACK_WEBHOOK}"
